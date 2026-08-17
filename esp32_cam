@@ -1,0 +1,2924 @@
+#include <Arduino.h>
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include <FS.h>
+#include <LittleFS.h>
+#include <Preferences.h>
+#include <time.h>
+
+
+// ============================================================
+// WIFI
+// ============================================================
+
+const char* ssid = "Mitlab-703";
+const char* password = "Mitlab703-2";
+
+
+// ============================================================
+// RASPBERRY PI UPLOAD SERVER
+// ============================================================
+//
+// esp_cam_receiver.py di Raspberry Pi menunggu POST JPEG mentah
+// ke endpoint /upload (lihat sagri/camera/upload_server.py).
+//
+// Ganti raspberryPiHost dengan IP Raspberry Pi di jaringan yang
+// sama (contoh: "192.168.1.50").
+//
+
+const char* raspberryPiHost     = "IP_RASPBERRY";
+const int   raspberryPiPort     = 5000;
+const char* raspberryPiCameraId = "esp_cam_01";
+
+
+// ============================================================
+// WAKTU / NTP
+// ============================================================
+
+// Taiwan = UTC +8
+// Jika nanti dipakai di WIB, ubah menjadi (7 * 3600)
+
+#define GMT_OFFSET_SEC       (8 * 3600)
+#define DAYLIGHT_OFFSET_SEC  0
+
+const char* ntpServer1 = "pool.ntp.org";
+const char* ntpServer2 = "time.nist.gov";
+
+
+// ============================================================
+// HTTP SERVER
+// ============================================================
+
+WebServer server(80);
+
+
+// ============================================================
+// PREFERENCES / NVS
+// ============================================================
+//
+// Digunakan supaya ESP32 ingat:
+// - apakah capture 05:00 sudah dilakukan
+// - apakah capture 12:00 sudah dilakukan
+// - apakah capture 17:00 sudah dilakukan
+// - kapan terakhir directory dibersihkan
+//
+// Jadi tetap aman jika ESP32 restart.
+//
+
+Preferences preferences;
+
+
+// ============================================================
+// ESP32-S3 N16R8 + OV2640 CAMERA PIN
+// ============================================================
+
+#define PWDN_GPIO_NUM     -1
+#define RESET_GPIO_NUM    -1
+
+#define XCLK_GPIO_NUM     15
+#define SIOD_GPIO_NUM      4
+#define SIOC_GPIO_NUM      5
+
+#define Y9_GPIO_NUM       16
+#define Y8_GPIO_NUM       17
+#define Y7_GPIO_NUM       18
+#define Y6_GPIO_NUM       12
+#define Y5_GPIO_NUM       10
+#define Y4_GPIO_NUM        8
+#define Y3_GPIO_NUM        9
+#define Y2_GPIO_NUM       11
+
+#define VSYNC_GPIO_NUM     6
+#define HREF_GPIO_NUM      7
+#define PCLK_GPIO_NUM     13
+
+
+// ============================================================
+// STORAGE
+// ============================================================
+
+#define IMAGE_DIRECTORY "/images"
+
+
+// ============================================================
+// STATUS JADWAL
+// ============================================================
+//
+// Nilai berisi ID tanggal.
+//
+// Contoh:
+// 2026-08-12 -> 20260812
+//
+
+int lastCaptureDate05 = -1;
+int lastCaptureDate12 = -1;
+int lastCaptureDate17 = -1;
+
+int lastCleanupDate = -1;
+
+
+// ============================================================
+// CEK FILE JPEG
+// ============================================================
+
+bool isImageFile(String filename) {
+
+  filename.toLowerCase();
+
+  return filename.endsWith(".jpg") ||
+         filename.endsWith(".jpeg");
+}
+
+
+// ============================================================
+// MEMBUAT ID TANGGAL
+// ============================================================
+//
+// Contoh:
+//
+// 2026-08-12
+//
+// menjadi:
+//
+// 20260812
+//
+
+int getDateID(const struct tm &timeinfo) {
+
+  int year =
+    timeinfo.tm_year + 1900;
+
+  int month =
+    timeinfo.tm_mon + 1;
+
+  int day =
+    timeinfo.tm_mday;
+
+
+  return
+    (year * 10000) +
+    (month * 100) +
+    day;
+}
+
+
+// ============================================================
+// AMBIL TIMESTAMP
+// ============================================================
+
+bool getTimestamp(
+  char* filenameTimestamp,
+  size_t filenameSize,
+  char* readableTimestamp,
+  size_t readableSize
+) {
+
+  struct tm timeinfo;
+
+
+  if (!getLocalTime(&timeinfo, 5000)) {
+
+    Serial.println(
+      "[TIME] ERROR: gagal mendapatkan waktu"
+    );
+
+    return false;
+  }
+
+
+  // ==========================================================
+  // TIMESTAMP UNTUK NAMA FILE
+  //
+  // contoh:
+  // 2026-08-12_05-00-01
+  // ==========================================================
+
+  strftime(
+    filenameTimestamp,
+    filenameSize,
+    "%Y-%m-%d_%H-%M-%S",
+    &timeinfo
+  );
+
+
+  // ==========================================================
+  // TIMESTAMP UNTUK SERIAL
+  //
+  // contoh:
+  // 2026-08-12 05:00:01
+  // ==========================================================
+
+  strftime(
+    readableTimestamp,
+    readableSize,
+    "%Y-%m-%d %H:%M:%S",
+    &timeinfo
+  );
+
+
+  return true;
+}
+
+
+// ============================================================
+// HITUNG JUMLAH FOTO
+// ============================================================
+
+int getImageCount() {
+
+  int count = 0;
+
+
+  File directory =
+    LittleFS.open(
+      IMAGE_DIRECTORY
+    );
+
+
+  if (
+    !directory ||
+    !directory.isDirectory()
+  ) {
+
+    return 0;
+  }
+
+
+  File file =
+    directory.openNextFile();
+
+
+  while (file) {
+
+    if (!file.isDirectory()) {
+
+      String filename =
+        String(file.path());
+
+
+      if (isImageFile(filename)) {
+
+        count++;
+      }
+    }
+
+
+    file.close();
+
+
+    file =
+      directory.openNextFile();
+  }
+
+
+  directory.close();
+
+
+  return count;
+}
+
+
+// ============================================================
+// CARI FOTO TERBARU
+// ============================================================
+
+String getLatestImagePath() {
+
+  File directory =
+    LittleFS.open(
+      IMAGE_DIRECTORY
+    );
+
+
+  if (
+    !directory ||
+    !directory.isDirectory()
+  ) {
+
+    Serial.println(
+      "[LATEST] Directory /images tidak ditemukan"
+    );
+
+    return "";
+  }
+
+
+  String latestFile = "";
+
+
+  File file =
+    directory.openNextFile();
+
+
+  while (file) {
+
+    if (!file.isDirectory()) {
+
+      // ======================================================
+      // FULL PATH
+      // ======================================================
+
+      String filename =
+        String(file.path());
+
+
+      if (isImageFile(filename)) {
+
+        if (
+          latestFile.length() == 0 ||
+          filename > latestFile
+        ) {
+
+          latestFile =
+            filename;
+        }
+      }
+    }
+
+
+    file.close();
+
+
+    file =
+      directory.openNextFile();
+  }
+
+
+  directory.close();
+
+
+  Serial.print(
+    "[LATEST] Dipilih: "
+  );
+
+  Serial.println(
+    latestFile
+  );
+
+
+  return latestFile;
+}
+
+
+// ============================================================
+// BUAT NAMA FILE UNIK
+// ============================================================
+
+String createUniqueFilename(
+  const char* timestamp
+) {
+
+  String base =
+    String(IMAGE_DIRECTORY) +
+    "/" +
+    timestamp;
+
+
+  String filename =
+    base +
+    ".jpg";
+
+
+  if (!LittleFS.exists(filename)) {
+
+    return filename;
+  }
+
+
+  // ==========================================================
+  // Jika ada capture dua kali pada detik yang sama
+  // ==========================================================
+
+  for (
+    int i = 1;
+    i <= 99;
+    i++
+  ) {
+
+    String candidate =
+      base +
+      "_" +
+      String(i) +
+      ".jpg";
+
+
+    if (!LittleFS.exists(candidate)) {
+
+      return candidate;
+    }
+  }
+
+
+  return "";
+}
+
+
+// ============================================================
+// CAPTURE + SIMPAN FOTO
+// ============================================================
+
+bool captureAndSaveImage(
+  String &savedPath
+) {
+
+  savedPath = "";
+
+
+  Serial.println();
+  Serial.println(
+    "=========================================="
+  );
+
+  Serial.println(
+    "[CAM] MEMULAI CAPTURE"
+  );
+
+  Serial.println(
+    "=========================================="
+  );
+
+
+  // ==========================================================
+  // TIMESTAMP
+  // ==========================================================
+
+  char filenameTimestamp[32];
+
+  char readableTimestamp[32];
+
+
+  if (
+    !getTimestamp(
+      filenameTimestamp,
+      sizeof(filenameTimestamp),
+
+      readableTimestamp,
+      sizeof(readableTimestamp)
+    )
+  ) {
+
+    Serial.println(
+      "[CAM] Capture dibatalkan: timestamp gagal"
+    );
+
+    return false;
+  }
+
+
+  Serial.print(
+    "[TIME] "
+  );
+
+  Serial.println(
+    readableTimestamp
+  );
+
+
+  // ==========================================================
+  // CAPTURE FRAME
+  // ==========================================================
+
+  uint32_t captureStart =
+    millis();
+
+
+  camera_fb_t* fb =
+    esp_camera_fb_get();
+
+
+  if (!fb) {
+
+    Serial.println(
+      "[CAM] ERROR: gagal mengambil frame"
+    );
+
+    return false;
+  }
+
+
+  Serial.println(
+    "[CAM] Capture berhasil"
+  );
+
+
+  Serial.print(
+    "[CAM] Resolusi : "
+  );
+
+  Serial.print(
+    fb->width
+  );
+
+  Serial.print(
+    " x "
+  );
+
+  Serial.println(
+    fb->height
+  );
+
+
+  Serial.print(
+    "[CAM] JPEG size : "
+  );
+
+  Serial.print(
+    fb->len
+  );
+
+  Serial.println(
+    " byte"
+  );
+
+
+  // ==========================================================
+  // NAMA FILE
+  // ==========================================================
+
+  String filename =
+    createUniqueFilename(
+      filenameTimestamp
+    );
+
+
+  if (filename.length() == 0) {
+
+    Serial.println(
+      "[FILE] ERROR: gagal membuat nama file"
+    );
+
+    esp_camera_fb_return(fb);
+
+    return false;
+  }
+
+
+  Serial.print(
+    "[FILE] Menyimpan: "
+  );
+
+  Serial.println(
+    filename
+  );
+
+
+  // ==========================================================
+  // BUKA FILE
+  // ==========================================================
+
+  File imageFile =
+    LittleFS.open(
+      filename,
+      FILE_WRITE
+    );
+
+
+  if (!imageFile) {
+
+    Serial.println(
+      "[FILE] ERROR: gagal membuka file"
+    );
+
+    esp_camera_fb_return(fb);
+
+    return false;
+  }
+
+
+  size_t imageSize =
+    fb->len;
+
+
+  // ==========================================================
+  // SIMPAN JPEG
+  // ==========================================================
+
+  size_t written =
+    imageFile.write(
+      fb->buf,
+      imageSize
+    );
+
+
+  imageFile.close();
+
+
+  // ==========================================================
+  // KEMBALIKAN FRAMEBUFFER
+  // ==========================================================
+
+  esp_camera_fb_return(fb);
+
+
+  // ==========================================================
+  // VALIDASI
+  // ==========================================================
+
+  if (written != imageSize) {
+
+    Serial.println(
+      "[FILE] ERROR: file tidak tertulis sempurna"
+    );
+
+
+    Serial.print(
+      "[FILE] Expected: "
+    );
+
+    Serial.println(
+      imageSize
+    );
+
+
+    Serial.print(
+      "[FILE] Written : "
+    );
+
+    Serial.println(
+      written
+    );
+
+
+    LittleFS.remove(
+      filename
+    );
+
+
+    return false;
+  }
+
+
+  savedPath =
+    filename;
+
+
+  uint32_t duration =
+    millis() - captureStart;
+
+
+  Serial.println();
+  Serial.println(
+    "[OK] FOTO BERHASIL DISIMPAN"
+  );
+
+
+  Serial.print(
+    "[FILE] "
+  );
+
+  Serial.println(
+    filename
+  );
+
+
+  Serial.print(
+    "[TIME] "
+  );
+
+  Serial.println(
+    readableTimestamp
+  );
+
+
+  Serial.print(
+    "[SIZE] "
+  );
+
+  Serial.print(
+    imageSize
+  );
+
+  Serial.println(
+    " byte"
+  );
+
+
+  Serial.print(
+    "[PROCESS] "
+  );
+
+  Serial.print(
+    duration
+  );
+
+  Serial.println(
+    " ms"
+  );
+
+
+  Serial.print(
+    "[STORAGE] Jumlah foto sekarang: "
+  );
+
+  Serial.println(
+    getImageCount()
+  );
+
+
+  Serial.print(
+    "[FS] Used : "
+  );
+
+  Serial.print(
+    LittleFS.usedBytes()
+  );
+
+  Serial.println(
+    " byte"
+  );
+
+
+  Serial.print(
+    "[FS] Total: "
+  );
+
+  Serial.print(
+    LittleFS.totalBytes()
+  );
+
+  Serial.println(
+    " byte"
+  );
+
+
+  Serial.println(
+    "=========================================="
+  );
+
+
+  return true;
+}
+
+
+// ============================================================
+// KIRIM FOTO KE RASPBERRY PI
+// ============================================================
+//
+// Membaca file JPEG dari LittleFS lalu mem-POST isinya ke
+// esp_cam_receiver.py di Raspberry Pi (endpoint /upload).
+//
+
+bool uploadImageToRaspberryPi(const String &path) {
+
+  if (WiFi.status() != WL_CONNECTED) {
+
+    Serial.println(
+      "[UPLOAD] DILEWATI: WiFi tidak terhubung"
+    );
+
+    return false;
+  }
+
+
+  File file =
+    LittleFS.open(
+      path,
+      FILE_READ
+    );
+
+
+  if (!file) {
+
+    Serial.println(
+      "[UPLOAD] ERROR: gagal membuka file untuk upload"
+    );
+
+    return false;
+  }
+
+
+  size_t fileSize =
+    file.size();
+
+
+  uint8_t* buffer =
+    (uint8_t*) malloc(fileSize);
+
+
+  if (!buffer) {
+
+    Serial.println(
+      "[UPLOAD] ERROR: gagal alokasi buffer upload"
+    );
+
+    file.close();
+
+    return false;
+  }
+
+
+  file.read(buffer, fileSize);
+
+  file.close();
+
+
+  String url =
+    String("http://") +
+    raspberryPiHost +
+    ":" +
+    String(raspberryPiPort) +
+    "/upload";
+
+
+  Serial.println();
+  Serial.println(
+    "=========================================="
+  );
+
+  Serial.println(
+    "[UPLOAD] Mengirim foto ke Raspberry Pi"
+  );
+
+  Serial.print(
+    "[UPLOAD] URL: "
+  );
+
+  Serial.println(
+    url
+  );
+
+
+  HTTPClient http;
+
+  http.begin(url);
+
+  http.addHeader(
+    "Content-Type",
+    "image/jpeg"
+  );
+
+  http.addHeader(
+    "X-Camera-ID",
+    raspberryPiCameraId
+  );
+
+
+  int statusCode =
+    http.POST(
+      buffer,
+      fileSize
+    );
+
+
+  free(buffer);
+
+
+  if (statusCode <= 0) {
+
+    Serial.print(
+      "[UPLOAD] GAGAL: "
+    );
+
+    Serial.println(
+      HTTPClient::errorToString(statusCode)
+    );
+
+    http.end();
+
+    return false;
+  }
+
+
+  String response =
+    http.getString();
+
+  Serial.print(
+    "[UPLOAD] HTTP status: "
+  );
+
+  Serial.println(
+    statusCode
+  );
+
+  Serial.print(
+    "[UPLOAD] Response  : "
+  );
+
+  Serial.println(
+    response
+  );
+
+
+  http.end();
+
+
+  bool success =
+    (statusCode == 200);
+
+
+  if (success) {
+
+    Serial.println(
+      "[UPLOAD] BERHASIL"
+    );
+
+  } else {
+
+    Serial.println(
+      "[UPLOAD] GAGAL: server menolak gambar"
+    );
+  }
+
+
+  Serial.println(
+    "=========================================="
+  );
+
+
+  return success;
+}
+
+
+// ============================================================
+// HAPUS SEMUA FOTO
+// ============================================================
+
+bool deleteAllImages() {
+
+  Serial.println();
+  Serial.println(
+    "=========================================="
+  );
+
+  Serial.println(
+    "[DAILY RESET] MENGHAPUS SEMUA FOTO"
+  );
+
+  Serial.println(
+    "=========================================="
+  );
+
+
+  File directory =
+    LittleFS.open(
+      IMAGE_DIRECTORY
+    );
+
+
+  if (
+    !directory ||
+    !directory.isDirectory()
+  ) {
+
+    Serial.println(
+      "[DAILY RESET] ERROR: /images tidak dapat dibuka"
+    );
+
+    return false;
+  }
+
+
+  // ==========================================================
+  // Simpan daftar nama file dahulu.
+  //
+  // Disediakan 32 slot supaya jika masih ada foto dari
+  // program versi lama semuanya bisa dibersihkan.
+  // ==========================================================
+
+  String filesToDelete[32];
+
+  int fileCount = 0;
+
+
+  File file =
+    directory.openNextFile();
+
+
+  while (
+    file &&
+    fileCount < 32
+  ) {
+
+    if (!file.isDirectory()) {
+
+      String filename =
+        String(file.path());
+
+
+      if (isImageFile(filename)) {
+
+        filesToDelete[fileCount] =
+          filename;
+
+        fileCount++;
+      }
+    }
+
+
+    file.close();
+
+
+    file =
+      directory.openNextFile();
+  }
+
+
+  directory.close();
+
+
+  Serial.print(
+    "[DAILY RESET] Jumlah foto ditemukan: "
+  );
+
+  Serial.println(
+    fileCount
+  );
+
+
+  // ==========================================================
+  // HAPUS FILE SATU PER SATU
+  // ==========================================================
+
+  int deletedCount = 0;
+
+
+  for (
+    int i = 0;
+    i < fileCount;
+    i++
+  ) {
+
+    Serial.print(
+      "[DELETE] "
+    );
+
+    Serial.println(
+      filesToDelete[i]
+    );
+
+
+    if (
+      LittleFS.remove(
+        filesToDelete[i]
+      )
+    ) {
+
+      deletedCount++;
+
+      Serial.println(
+        "         BERHASIL"
+      );
+
+    }
+
+    else {
+
+      Serial.println(
+        "         GAGAL"
+      );
+    }
+  }
+
+
+  Serial.print(
+    "[DAILY RESET] Terhapus: "
+  );
+
+  Serial.print(
+    deletedCount
+  );
+
+  Serial.print(
+    "/"
+  );
+
+  Serial.println(
+    fileCount
+  );
+
+
+  Serial.println(
+    "=========================================="
+  );
+
+
+  return deletedCount == fileCount;
+}
+
+
+// ============================================================
+// CEK PERGANTIAN HARI
+// ============================================================
+//
+// Tidak hanya memeriksa pukul 00:00.
+//
+// Contoh:
+//
+// ESP mati 23:50
+// ESP hidup lagi 02:00
+//
+// Setelah NTP tersinkron,
+// ESP tetap mengetahui bahwa tanggal telah berubah
+// dan akan menghapus foto kemarin.
+//
+
+void checkDailyCleanup() {
+
+  struct tm timeinfo;
+
+
+  if (
+    !getLocalTime(
+      &timeinfo,
+      1000
+    )
+  ) {
+
+    return;
+  }
+
+
+  int currentDate =
+    getDateID(
+      timeinfo
+    );
+
+
+  // ==========================================================
+  // SUDAH DIBERSIHKAN HARI INI
+  // ==========================================================
+
+  if (
+    lastCleanupDate ==
+    currentDate
+  ) {
+
+    return;
+  }
+
+
+  // ==========================================================
+  // HARI BARU
+  // ==========================================================
+
+  Serial.println();
+  Serial.println(
+    "##########################################"
+  );
+
+  Serial.println(
+    "[DAILY RESET] HARI BARU TERDETEKSI"
+  );
+
+
+  Serial.printf(
+    "[DAILY RESET] %04d-%02d-%02d %02d:%02d:%02d\n",
+
+    timeinfo.tm_year + 1900,
+    timeinfo.tm_mon + 1,
+    timeinfo.tm_mday,
+
+    timeinfo.tm_hour,
+    timeinfo.tm_min,
+    timeinfo.tm_sec
+  );
+
+
+  Serial.println(
+    "##########################################"
+  );
+
+
+  // ==========================================================
+  // HAPUS FOTO
+  // ==========================================================
+
+  if (
+    deleteAllImages()
+  ) {
+
+    lastCleanupDate =
+      currentDate;
+
+
+    preferences.putInt(
+      "lastCleanup",
+      currentDate
+    );
+
+
+    Serial.println(
+      "[DAILY RESET] Storage siap untuk hari baru"
+    );
+
+  }
+
+  else {
+
+    Serial.println(
+      "[DAILY RESET] Cleanup GAGAL"
+    );
+
+    Serial.println(
+      "[DAILY RESET] Akan dicoba lagi"
+    );
+  }
+}
+
+
+// ============================================================
+// KIRIM JPEG MELALUI HTTP
+// ============================================================
+
+void sendImageFile(
+  String filename
+) {
+
+  Serial.println();
+  Serial.println(
+    "=========================================="
+  );
+
+  Serial.println(
+    "[HTTP IMAGE] REQUEST"
+  );
+
+
+  Serial.print(
+    "[HTTP IMAGE] Path: "
+  );
+
+  Serial.println(
+    filename
+  );
+
+
+  // ==========================================================
+  // VALIDASI
+  // ==========================================================
+
+  if (filename.length() == 0) {
+
+    server.send(
+      404,
+      "text/plain",
+      "Filename kosong"
+    );
+
+    return;
+  }
+
+
+  if (
+    !filename.startsWith(
+      IMAGE_DIRECTORY
+    )
+  ) {
+
+    server.send(
+      403,
+      "text/plain",
+      "Path tidak valid"
+    );
+
+    return;
+  }
+
+
+  if (!LittleFS.exists(filename)) {
+
+    server.send(
+      404,
+      "text/plain",
+      "Image tidak ditemukan"
+    );
+
+    return;
+  }
+
+
+  File file =
+    LittleFS.open(
+      filename,
+      FILE_READ
+    );
+
+
+  if (!file) {
+
+    server.send(
+      500,
+      "text/plain",
+      "Gagal membuka image"
+    );
+
+    return;
+  }
+
+
+  size_t fileSize =
+    file.size();
+
+
+  Serial.print(
+    "[HTTP IMAGE] File size: "
+  );
+
+  Serial.print(
+    fileSize
+  );
+
+  Serial.println(
+    " byte"
+  );
+
+
+  // ==========================================================
+  // NONAKTIFKAN CACHE
+  // ==========================================================
+
+  server.sendHeader(
+    "Cache-Control",
+    "no-store, no-cache, must-revalidate"
+  );
+
+
+  // ==========================================================
+  // STREAM FILE
+  // ==========================================================
+
+  size_t sent =
+    server.streamFile(
+      file,
+      "image/jpeg"
+    );
+
+
+  file.close();
+
+
+  Serial.print(
+    "[HTTP IMAGE] Sent: "
+  );
+
+  Serial.print(
+    sent
+  );
+
+  Serial.println(
+    " byte"
+  );
+
+
+  if (sent == fileSize) {
+
+    Serial.println(
+      "[HTTP IMAGE] BERHASIL"
+    );
+
+  }
+
+  else {
+
+    Serial.println(
+      "[HTTP IMAGE] WARNING: jumlah byte berbeda"
+    );
+  }
+
+
+  Serial.println(
+    "=========================================="
+  );
+}
+
+
+// ============================================================
+// HTTP HOME
+// ============================================================
+
+void handleRoot() {
+
+  String html =
+R"rawliteral(
+<!DOCTYPE html>
+
+<html>
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta
+name="viewport"
+content="width=device-width, initial-scale=1">
+
+<title>ESP32-S3 Camera</title>
+
+<style>
+
+body {
+  background: #111;
+  color: white;
+  font-family: Arial, sans-serif;
+  text-align: center;
+  margin: 20px;
+}
+
+h1 {
+  margin-bottom: 5px;
+}
+
+.info {
+  color: #cccccc;
+  font-size: 18px;
+}
+
+.schedule {
+  font-size: 20px;
+  line-height: 1.8;
+}
+
+.cleanup {
+  margin-top: 20px;
+  color: #dddddd;
+}
+
+button {
+  padding: 12px 20px;
+  margin: 8px;
+  font-size: 16px;
+  cursor: pointer;
+}
+
+img {
+  max-width: 95%;
+  margin-top: 20px;
+  border-radius: 8px;
+}
+
+</style>
+
+</head>
+
+
+<body>
+
+<h1>ESP32-S3 Camera</h1>
+
+<p class="info">
+OV2640 Daily Camera Logger
+</p>
+
+
+<div class="schedule">
+
+&#128247; 05:00
+<br>
+
+&#128247; 12:00
+<br>
+
+&#128247; 17:00
+
+</div>
+
+
+<p class="cleanup">
+&#128465; Foto dihapus setiap hari baru
+</p>
+
+
+<br>
+
+
+<button onclick="window.location.href='/capture'">
+Capture Sekarang
+</button>
+
+
+<button onclick="window.location.href='/gallery'">
+Buka Gallery
+</button>
+
+
+<h3>Foto Terbaru</h3>
+
+
+<img
+src="/latest"
+alt="Belum ada foto hari ini">
+
+</body>
+
+</html>
+)rawliteral";
+
+
+  // PENTING:
+  // kasih tahu browser kalau HTML menggunakan UTF-8
+  server.send(
+    200,
+    "text/html; charset=utf-8",
+    html
+  );
+}
+
+
+// ============================================================
+// HTTP /LATEST
+// ============================================================
+
+void handleLatest() {
+
+  Serial.println(
+    "[HTTP] /latest"
+  );
+
+
+  String latest =
+    getLatestImagePath();
+
+
+  if (
+    latest.length() == 0
+  ) {
+
+    server.send(
+      404,
+      "text/plain",
+      "Belum ada foto hari ini"
+    );
+
+    return;
+  }
+
+
+  sendImageFile(
+    latest
+  );
+}
+
+
+// ============================================================
+// HTTP /CAPTURE
+// ============================================================
+//
+// Capture manual juga ikut disimpan.
+// File tersebut juga akan terhapus saat hari berganti.
+//
+
+void handleManualCapture() {
+
+  Serial.println();
+  Serial.println(
+    "[HTTP] Manual capture"
+  );
+
+
+  String savedFile;
+
+
+  if (
+    captureAndSaveImage(
+      savedFile
+    )
+  ) {
+
+    sendImageFile(
+      savedFile
+    );
+
+    uploadImageToRaspberryPi(
+      savedFile
+    );
+
+  }
+
+  else {
+
+    server.send(
+      500,
+      "text/plain",
+      "Capture gagal"
+    );
+  }
+}
+
+
+// ============================================================
+// HTTP /IMAGE?FILE=
+// ============================================================
+
+void handleImage() {
+
+  if (
+    !server.hasArg(
+      "file"
+    )
+  ) {
+
+    server.send(
+      400,
+      "text/plain",
+      "Parameter file tidak ada"
+    );
+
+    return;
+  }
+
+
+  String filename =
+    server.arg(
+      "file"
+    );
+
+
+  // ==========================================================
+  // PROTEKSI PATH
+  // ==========================================================
+
+  if (
+    !filename.startsWith("/images/") ||
+    filename.indexOf("..") >= 0
+  ) {
+
+    server.send(
+      403,
+      "text/plain",
+      "Path tidak valid"
+    );
+
+    return;
+  }
+
+
+  sendImageFile(
+    filename
+  );
+}
+
+
+// ============================================================
+// HTTP /GALLERY
+// ============================================================
+
+void handleGallery() {
+
+  Serial.println(
+    "[HTTP] Membuka gallery"
+  );
+
+
+  // Normalnya 3 foto/hari.
+  // Tetapi disediakan ruang tambahan untuk capture manual.
+
+  const int MAX_GALLERY_FILES = 32;
+
+
+  String files[
+    MAX_GALLERY_FILES
+  ];
+
+
+  int count = 0;
+
+
+  File directory =
+    LittleFS.open(
+      IMAGE_DIRECTORY
+    );
+
+
+  if (
+    directory &&
+    directory.isDirectory()
+  ) {
+
+    File file =
+      directory.openNextFile();
+
+
+    while (
+      file &&
+      count < MAX_GALLERY_FILES
+    ) {
+
+      if (!file.isDirectory()) {
+
+        // Full path
+        String filename =
+          String(file.path());
+
+
+        if (isImageFile(filename)) {
+
+          files[count] =
+            filename;
+
+          count++;
+        }
+      }
+
+
+      file.close();
+
+
+      file =
+        directory.openNextFile();
+    }
+
+
+    directory.close();
+  }
+
+
+  // ==========================================================
+  // SORT TERBARU → TERLAMA
+  // ==========================================================
+
+  for (
+    int i = 0;
+    i < count - 1;
+    i++
+  ) {
+
+    for (
+      int j = i + 1;
+      j < count;
+      j++
+    ) {
+
+      if (
+        files[j] >
+        files[i]
+      ) {
+
+        String temp =
+          files[i];
+
+
+        files[i] =
+          files[j];
+
+
+        files[j] =
+          temp;
+      }
+    }
+  }
+
+
+  // ==========================================================
+  // HTML
+  // ==========================================================
+
+  String html =
+    "<!DOCTYPE html>"
+    "<html>"
+    "<head>"
+    "<meta name='viewport' "
+    "content='width=device-width,initial-scale=1'>"
+    "<title>ESP32 Gallery</title>"
+    "<style>"
+    "body{font-family:Arial;background:#111;color:white;text-align:center;}"
+    "img{max-width:95%;width:640px;border-radius:8px;}"
+    "a{color:#66bbff;}"
+    ".photo{margin-bottom:40px;}"
+    "</style>"
+    "</head>"
+    "<body>";
+
+
+  html +=
+    "<h1>Foto Hari Ini</h1>";
+
+
+  html +=
+    "<p>Total foto: " +
+    String(count) +
+    "</p>";
+
+
+  html +=
+    "<p><a href='/'>Kembali ke Home</a></p>";
+
+
+  // ==========================================================
+  // TAMPILKAN FOTO
+  // ==========================================================
+
+  for (
+    int i = 0;
+    i < count;
+    i++
+  ) {
+
+    String displayName =
+      files[i];
+
+
+    displayName.replace(
+      "/images/",
+      ""
+    );
+
+
+    displayName.replace(
+      ".jpg",
+      ""
+    );
+
+
+    displayName.replace(
+      "_",
+      " "
+    );
+
+
+    html +=
+      "<div class='photo'>";
+
+
+    html +=
+      "<h3>" +
+      displayName +
+      "</h3>";
+
+
+    html +=
+      "<img src='/image?file=" +
+      files[i] +
+      "'>";
+
+
+    html +=
+      "</div>";
+  }
+
+
+  if (count == 0) {
+
+    html +=
+      "<p>Belum ada foto hari ini.</p>";
+  }
+
+
+  html +=
+    "</body></html>";
+
+
+  server.send(
+    200,
+    "text/html",
+    html
+  );
+}
+
+
+// ============================================================
+// SETUP CAMERA
+// ============================================================
+
+bool setupCamera() {
+
+  camera_config_t config = {};
+
+
+  config.ledc_channel =
+    LEDC_CHANNEL_0;
+
+
+  config.ledc_timer =
+    LEDC_TIMER_0;
+
+
+  // ==========================================================
+  // DATA PIN
+  // ==========================================================
+
+  config.pin_d0 =
+    Y2_GPIO_NUM;
+
+  config.pin_d1 =
+    Y3_GPIO_NUM;
+
+  config.pin_d2 =
+    Y4_GPIO_NUM;
+
+  config.pin_d3 =
+    Y5_GPIO_NUM;
+
+  config.pin_d4 =
+    Y6_GPIO_NUM;
+
+  config.pin_d5 =
+    Y7_GPIO_NUM;
+
+  config.pin_d6 =
+    Y8_GPIO_NUM;
+
+  config.pin_d7 =
+    Y9_GPIO_NUM;
+
+
+  // ==========================================================
+  // CLOCK / SYNC
+  // ==========================================================
+
+  config.pin_xclk =
+    XCLK_GPIO_NUM;
+
+
+  config.pin_pclk =
+    PCLK_GPIO_NUM;
+
+
+  config.pin_vsync =
+    VSYNC_GPIO_NUM;
+
+
+  config.pin_href =
+    HREF_GPIO_NUM;
+
+
+  // ==========================================================
+  // SCCB
+  // ==========================================================
+
+  config.pin_sccb_sda =
+    SIOD_GPIO_NUM;
+
+
+  config.pin_sccb_scl =
+    SIOC_GPIO_NUM;
+
+
+  // ==========================================================
+  // POWER
+  // ==========================================================
+
+  config.pin_pwdn =
+    PWDN_GPIO_NUM;
+
+
+  config.pin_reset =
+    RESET_GPIO_NUM;
+
+
+  // ==========================================================
+  // OV2640 CLOCK
+  // ==========================================================
+
+  config.xclk_freq_hz =
+    20000000;
+
+
+  config.pixel_format =
+    PIXFORMAT_JPEG;
+
+
+  // ==========================================================
+  // PSRAM
+  // ==========================================================
+
+  if (psramFound()) {
+
+    Serial.println(
+      "[CAM] PSRAM ditemukan"
+    );
+
+
+    config.frame_size =
+      FRAMESIZE_VGA;
+
+
+    config.jpeg_quality =
+      10;
+
+
+    config.fb_count =
+      2;
+
+
+    config.grab_mode =
+      CAMERA_GRAB_LATEST;
+
+
+    config.fb_location =
+      CAMERA_FB_IN_PSRAM;
+
+  }
+
+  else {
+
+    Serial.println(
+      "[CAM] WARNING: PSRAM tidak ditemukan"
+    );
+
+
+    config.frame_size =
+      FRAMESIZE_QVGA;
+
+
+    config.jpeg_quality =
+      12;
+
+
+    config.fb_count =
+      1;
+
+
+    config.grab_mode =
+      CAMERA_GRAB_WHEN_EMPTY;
+
+
+    config.fb_location =
+      CAMERA_FB_IN_DRAM;
+  }
+
+
+  // ==========================================================
+  // INIT
+  // ==========================================================
+
+  esp_err_t error =
+    esp_camera_init(
+      &config
+    );
+
+
+  if (
+    error != ESP_OK
+  ) {
+
+    Serial.printf(
+      "[CAM] ERROR init: 0x%x\n",
+      error
+    );
+
+
+    return false;
+  }
+
+
+  Serial.println(
+    "[CAM] Kamera berhasil diinisialisasi"
+  );
+
+
+  // ==========================================================
+  // SENSOR INFO
+  // ==========================================================
+
+  sensor_t* sensor =
+    esp_camera_sensor_get();
+
+
+  if (
+    sensor != nullptr
+  ) {
+
+    Serial.print(
+      "[CAM] Sensor PID: 0x"
+    );
+
+
+    Serial.println(
+      sensor->id.PID,
+      HEX
+    );
+  }
+
+
+  return true;
+}
+
+
+// ============================================================
+// EKSEKUSI CAPTURE TERJADWAL
+// ============================================================
+
+void performScheduledCapture(
+  const char* scheduleName,
+  int currentDate,
+  int &lastDate,
+  const char* preferenceKey
+) {
+
+  Serial.println();
+  Serial.println(
+    "##########################################"
+  );
+
+
+  Serial.print(
+    "[SCHEDULE] CAPTURE "
+  );
+
+  Serial.println(
+    scheduleName
+  );
+
+
+  Serial.println(
+    "##########################################"
+  );
+
+
+  String savedImage;
+
+
+  if (
+    captureAndSaveImage(
+      savedImage
+    )
+  ) {
+
+    Serial.print(
+      "[SCHEDULE] Capture "
+    );
+
+    Serial.print(
+      scheduleName
+    );
+
+    Serial.println(
+      " BERHASIL"
+    );
+
+
+    // ========================================================
+    // KIRIM KE RASPBERRY PI
+    // ========================================================
+
+    uploadImageToRaspberryPi(
+      savedImage
+    );
+
+
+    // ========================================================
+    // UPDATE RAM
+    // ========================================================
+
+    lastDate =
+      currentDate;
+
+
+    // ========================================================
+    // SIMPAN KE NVS
+    // ========================================================
+
+    preferences.putInt(
+      preferenceKey,
+      currentDate
+    );
+
+  }
+
+  else {
+
+    Serial.print(
+      "[SCHEDULE] Capture "
+    );
+
+    Serial.print(
+      scheduleName
+    );
+
+    Serial.println(
+      " GAGAL"
+    );
+  }
+}
+
+
+// ============================================================
+// CEK JADWAL
+// ============================================================
+
+void checkScheduledCapture() {
+
+  struct tm timeinfo;
+
+
+  if (
+    !getLocalTime(
+      &timeinfo,
+      1000
+    )
+  ) {
+
+    return;
+  }
+
+
+  int currentHour =
+    timeinfo.tm_hour;
+
+
+  int currentMinute =
+    timeinfo.tm_min;
+
+
+  int currentDate =
+    getDateID(
+      timeinfo
+    );
+
+
+  // ==========================================================
+  // CAPTURE HANYA PADA MENIT 00
+  //
+  // Loop berjalan tiap 500 ms sehingga tidak masalah jika
+  // detiknya 00, 01, 02, dst.
+  //
+  // NVS mencegah capture berulang selama menit tersebut.
+  // ==========================================================
+
+  if (
+    currentMinute != 0
+  ) {
+
+    return;
+  }
+
+
+  // ==========================================================
+  // 05:00
+  // ==========================================================
+
+  if (
+    currentHour == 5 &&
+    lastCaptureDate05 != currentDate
+  ) {
+
+    performScheduledCapture(
+      "05:00",
+      currentDate,
+      lastCaptureDate05,
+      "last05"
+    );
+
+
+    return;
+  }
+
+
+  // ==========================================================
+  // 12:00
+  // ==========================================================
+
+  if (
+    currentHour == 12 &&
+    lastCaptureDate12 != currentDate
+  ) {
+
+    performScheduledCapture(
+      "12:00",
+      currentDate,
+      lastCaptureDate12,
+      "last12"
+    );
+
+
+    return;
+  }
+
+
+  // ==========================================================
+  // 17:00
+  // ==========================================================
+
+  if (
+    currentHour == 17 &&
+    lastCaptureDate17 != currentDate
+  ) {
+
+    performScheduledCapture(
+      "17:00",
+      currentDate,
+      lastCaptureDate17,
+      "last17"
+    );
+
+
+    return;
+  }
+}
+
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup() {
+
+  // ==========================================================
+  // SERIAL
+  // ==========================================================
+
+  Serial.begin(
+    115200
+  );
+
+
+  delay(
+    2000
+  );
+
+
+  Serial.println();
+  Serial.println(
+    "=========================================="
+  );
+
+  Serial.println(
+    "ESP32-S3 DAILY CAMERA LOGGER"
+  );
+
+  Serial.println(
+    "OV2640"
+  );
+
+  Serial.println(
+    "05:00 / 12:00 / 17:00"
+  );
+
+  Serial.println(
+    "RESET FOTO SETIAP HARI"
+  );
+
+  Serial.println(
+    "=========================================="
+  );
+
+
+  // ==========================================================
+  // BOARD INFO
+  // ==========================================================
+
+  Serial.print(
+    "Chip  : "
+  );
+
+  Serial.println(
+    ESP.getChipModel()
+  );
+
+
+  Serial.print(
+    "CPU   : "
+  );
+
+  Serial.print(
+    ESP.getCpuFreqMHz()
+  );
+
+  Serial.println(
+    " MHz"
+  );
+
+
+  Serial.print(
+    "Flash : "
+  );
+
+  Serial.print(
+    ESP.getFlashChipSize()
+    / 1024
+    / 1024
+  );
+
+  Serial.println(
+    " MB"
+  );
+
+
+  Serial.print(
+    "PSRAM : "
+  );
+
+  Serial.print(
+    ESP.getPsramSize()
+    / 1024
+    / 1024
+  );
+
+  Serial.println(
+    " MB"
+  );
+
+
+  // ==========================================================
+  // LITTLEFS
+  // ==========================================================
+
+  Serial.println();
+  Serial.println(
+    "[FS] Mount LittleFS..."
+  );
+
+
+  if (!LittleFS.begin(true)) {
+
+    Serial.println(
+      "[FS] ERROR: LittleFS gagal"
+    );
+
+    return;
+  }
+
+
+  Serial.println(
+    "[FS] LittleFS siap"
+  );
+
+
+  Serial.print(
+    "[FS] Total : "
+  );
+
+  Serial.print(
+    LittleFS.totalBytes()
+  );
+
+  Serial.println(
+    " byte"
+  );
+
+
+  Serial.print(
+    "[FS] Used  : "
+  );
+
+  Serial.print(
+    LittleFS.usedBytes()
+  );
+
+  Serial.println(
+    " byte"
+  );
+
+
+  // ==========================================================
+  // DIRECTORY /images
+  // ==========================================================
+
+  if (
+    !LittleFS.exists(
+      IMAGE_DIRECTORY
+    )
+  ) {
+
+    Serial.println(
+      "[FS] Membuat /images..."
+    );
+
+
+    if (
+      !LittleFS.mkdir(
+        IMAGE_DIRECTORY
+      )
+    ) {
+
+      Serial.println(
+        "[FS] ERROR membuat /images"
+      );
+
+      return;
+    }
+
+
+    Serial.println(
+      "[FS] /images berhasil dibuat"
+    );
+
+  }
+
+  else {
+
+    Serial.println(
+      "[FS] Directory /images tersedia"
+    );
+  }
+
+
+  Serial.print(
+    "[FS] Jumlah foto saat boot: "
+  );
+
+  Serial.println(
+    getImageCount()
+  );
+
+
+  // ==========================================================
+  // CAMERA
+  // ==========================================================
+
+  Serial.println();
+  Serial.println(
+    "[CAM] Init OV2640..."
+  );
+
+
+  if (!setupCamera()) {
+
+    Serial.println(
+      "[CAM] STOP: kamera gagal"
+    );
+
+    return;
+  }
+
+
+  // ==========================================================
+  // WIFI
+  // ==========================================================
+
+  Serial.println();
+  Serial.print(
+    "[WiFi] Connecting ke: "
+  );
+
+  Serial.println(
+    ssid
+  );
+
+
+  WiFi.mode(
+    WIFI_STA
+  );
+
+
+  WiFi.begin(
+    ssid,
+    password
+  );
+
+
+  uint32_t wifiStart =
+    millis();
+
+
+  while (
+    WiFi.status() != WL_CONNECTED
+  ) {
+
+    delay(
+      500
+    );
+
+
+    Serial.print(
+      "."
+    );
+
+
+    if (
+      millis() - wifiStart >
+      30000
+    ) {
+
+      Serial.println();
+
+      Serial.println(
+        "[WiFi] ERROR: timeout"
+      );
+
+      return;
+    }
+  }
+
+
+  Serial.println();
+
+  Serial.println(
+    "[WiFi] Connected"
+  );
+
+
+  Serial.print(
+    "[WiFi] IP: "
+  );
+
+  Serial.println(
+    WiFi.localIP()
+  );
+
+
+  // ==========================================================
+  // NTP
+  // ==========================================================
+
+  Serial.println();
+  Serial.println(
+    "[TIME] Sinkronisasi NTP..."
+  );
+
+
+  configTime(
+    GMT_OFFSET_SEC,
+    DAYLIGHT_OFFSET_SEC,
+    ntpServer1,
+    ntpServer2
+  );
+
+
+  struct tm timeinfo;
+
+
+  if (
+    !getLocalTime(
+      &timeinfo,
+      15000
+    )
+  ) {
+
+    Serial.println(
+      "[TIME] ERROR sinkronisasi NTP"
+    );
+
+    return;
+  }
+
+
+  Serial.println(
+    "[TIME] Sinkronisasi BERHASIL"
+  );
+
+
+  Serial.printf(
+    "[TIME] %04d-%02d-%02d %02d:%02d:%02d\n",
+
+    timeinfo.tm_year + 1900,
+    timeinfo.tm_mon + 1,
+    timeinfo.tm_mday,
+
+    timeinfo.tm_hour,
+    timeinfo.tm_min,
+    timeinfo.tm_sec
+  );
+
+
+  // ==========================================================
+  // PREFERENCES / NVS
+  // ==========================================================
+
+  preferences.begin(
+    "camSchedule",
+    false
+  );
+
+
+  lastCaptureDate05 =
+    preferences.getInt(
+      "last05",
+      -1
+    );
+
+
+  lastCaptureDate12 =
+    preferences.getInt(
+      "last12",
+      -1
+    );
+
+
+  lastCaptureDate17 =
+    preferences.getInt(
+      "last17",
+      -1
+    );
+
+
+  lastCleanupDate =
+    preferences.getInt(
+      "lastCleanup",
+      -1
+    );
+
+
+  Serial.println();
+  Serial.println(
+    "[NVS] Status:"
+  );
+
+
+  Serial.print(
+    "Last 05:00    : "
+  );
+
+  Serial.println(
+    lastCaptureDate05
+  );
+
+
+  Serial.print(
+    "Last 12:00    : "
+  );
+
+  Serial.println(
+    lastCaptureDate12
+  );
+
+
+  Serial.print(
+    "Last 17:00    : "
+  );
+
+  Serial.println(
+    lastCaptureDate17
+  );
+
+
+  Serial.print(
+    "Last cleanup  : "
+  );
+
+  Serial.println(
+    lastCleanupDate
+  );
+
+
+  // ==========================================================
+  // CLEANUP HARI BARU
+  // ==========================================================
+  //
+  // Dilakukan SEBELUM jadwal capture dicek.
+  //
+  // Jadi foto kemarin pasti dibersihkan dahulu.
+  // ==========================================================
+
+  checkDailyCleanup();
+
+
+  // ==========================================================
+  // HTTP ROUTES
+  // ==========================================================
+
+  server.on(
+    "/",
+    HTTP_GET,
+    handleRoot
+  );
+
+
+  server.on(
+    "/latest",
+    HTTP_GET,
+    handleLatest
+  );
+
+
+  server.on(
+    "/capture",
+    HTTP_GET,
+    handleManualCapture
+  );
+
+
+  server.on(
+    "/gallery",
+    HTTP_GET,
+    handleGallery
+  );
+
+
+  server.on(
+    "/image",
+    HTTP_GET,
+    handleImage
+  );
+
+
+  server.begin();
+
+
+  // ==========================================================
+  // SERVER INFO
+  // ==========================================================
+
+  Serial.println();
+  Serial.println(
+    "=========================================="
+  );
+
+  Serial.println(
+    "HTTP SERVER AKTIF"
+  );
+
+  Serial.println(
+    "=========================================="
+  );
+
+
+  Serial.print(
+    "Home    : http://"
+  );
+
+  Serial.println(
+    WiFi.localIP()
+  );
+
+
+  Serial.print(
+    "Latest  : http://"
+  );
+
+  Serial.print(
+    WiFi.localIP()
+  );
+
+  Serial.println(
+    "/latest"
+  );
+
+
+  Serial.print(
+    "Capture : http://"
+  );
+
+  Serial.print(
+    WiFi.localIP()
+  );
+
+  Serial.println(
+    "/capture"
+  );
+
+
+  Serial.print(
+    "Gallery : http://"
+  );
+
+  Serial.print(
+    WiFi.localIP()
+  );
+
+  Serial.println(
+    "/gallery"
+  );
+
+
+  Serial.println();
+  Serial.println(
+    "JADWAL:"
+  );
+
+  Serial.println(
+    "00:00 -> hapus foto"
+  );
+
+  Serial.println(
+    "05:00 -> capture"
+  );
+
+  Serial.println(
+    "12:00 -> capture"
+  );
+
+  Serial.println(
+    "17:00 -> capture"
+  );
+
+
+  Serial.println(
+    "=========================================="
+  );
+
+
+  // ==========================================================
+  // CEK JADWAL SETELAH BOOT
+  // ==========================================================
+
+  checkScheduledCapture();
+}
+
+
+// ============================================================
+// LOOP
+// ============================================================
+
+void loop() {
+
+  // ==========================================================
+  // HTTP
+  // ==========================================================
+
+  server.handleClient();
+
+
+  // ==========================================================
+  // CEK PERGANTIAN HARI
+  //
+  // Dijalankan sebelum capture schedule.
+  // ==========================================================
+
+  checkDailyCleanup();
+
+
+  // ==========================================================
+  // CEK JADWAL CAPTURE
+  // ==========================================================
+
+  checkScheduledCapture();
+
+
+  // Dua kali pengecekan per detik cukup
+  delay(
+    500
+  );
+}
