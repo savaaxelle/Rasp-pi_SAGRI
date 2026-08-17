@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "PowerShell(python \"C:\\\\Users\\\\mitlab\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Rasp-pi-SAGRI\\\\a8cff03d-8699-4d6f-9483-88aa9f0d1c47\\\\scratchpad\\\\cloud_smoke_test.py\")",
-      "PowerShell(python local_api.py)"
-    ]
-  }
-}
