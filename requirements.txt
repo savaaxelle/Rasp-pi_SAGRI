@@ -1,0 +1,13 @@
+# Core dependencies — needed by every service (sensor receiver, camera
+# receiver, local API, cloud adapter).
+flask>=3.0
+pyserial>=3.5
+numpy>=1.24
+Pillow>=10.0
+requests>=2.31
+
+# Needed only by inference_worker.py, and only while
+# SAGRI_ENABLE_INFERENCE is on (default: on). TensorFlow on a Raspberry
+# Pi can be slow to install and needs a 64-bit OS — if you don't have a
+# model ready yet, set SAGRI_ENABLE_INFERENCE=0 and skip this line.
+tensorflow>=2.15

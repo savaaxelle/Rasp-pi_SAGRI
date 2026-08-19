@@ -1,4 +1,5 @@
 import subprocess
+import sys
 from pathlib import Path
 
 DEFAULT_RESTART_DELAY = 5
@@ -42,7 +43,10 @@ class ManagedProcess:
 
         try:
             self._process = subprocess.Popen(
-                ["python3", str(self._filepath)],
+                # sys.executable, not a literal "python3": guarantees
+                # every subprocess uses the same interpreter (and venv,
+                # if any) as run_raspi_all.py itself.
+                [sys.executable, str(self._filepath)],
                 cwd=str(self._project_directory),
             )
         except Exception as error:
