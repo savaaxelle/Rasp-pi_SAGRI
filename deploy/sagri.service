@@ -10,18 +10,34 @@ Type=simple
 # own python3 (created by setup.sh) so it — and every service it spawns
 # (via sys.executable) — uses the venv's installed packages, not
 # whatever python3 happens to be on the system PATH.
+#
+# WorkingDirectory/ExecStart point at where the CODE lives. Data
+# (data/, models/) is a separate path — see SAGRI_DATA_DIR below —
+# and does not need to be inside this directory at all.
 User=dila
-WorkingDirectory=/home/dila/projects/raspi2
-ExecStart=/home/dila/projects/raspi2/venv/bin/python3 /home/dila/projects/raspi2/run_raspi_all.py
+WorkingDirectory=/home/dila/projects/Rasp-pi_SAGRI
+ExecStart=/home/dila/projects/Rasp-pi_SAGRI/venv/bin/python3 /home/dila/projects/Rasp-pi_SAGRI/run_raspi_all.py
 
 Restart=on-failure
 RestartSec=5
 
+# REQUIRED: esp_cam_scheduler.py refuses to start without this — it's
+# the ESP32-CAM's address (ESP32_CAM_HTTP_RaspberryPi_Trigger.cpp).
+# Fill in the real IP before enabling this service.
+Environment=SAGRI_ESP_CAM_URL=http://ESP_CAM_IP
+
+# Optional: when the Pi requests a fresh photo. Change this — not the
+# firmware — to change the capture schedule. Default: 7,12,17.
+# Environment=SAGRI_CAPTURE_HOURS=7,12,17
+
 # Uncomment and edit any of these as needed — they're read by
 # sagri/config.py::ProjectConfig.from_env(). Leave commented to use
-# the defaults (project dir /home/dila/projects/raspi2, inference on,
-# cloud sync off).
-# Environment=SAGRI_PROJECT_DIR=/home/dila/projects/raspi2
+# the defaults: code directory auto-detected (see sagri/config.py),
+# data/models at /home/dila/projects/raspi2, inference on, cloud sync
+# off. SAGRI_PROJECT_DIR only needs setting if the code's real location
+# and WorkingDirectory above ever genuinely differ.
+# Environment=SAGRI_PROJECT_DIR=/home/dila/projects/Rasp-pi_SAGRI
+# Environment=SAGRI_DATA_DIR=/home/dila/projects/raspi2
 # Environment=SAGRI_ENABLE_INFERENCE=0
 # Environment=SAGRI_NODE_ID=7
 # Environment=SAGRI_ENABLE_CLOUD_SYNC=1

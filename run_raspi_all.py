@@ -1,4 +1,4 @@
-from sagri.config import ProjectConfig
+from sagri.config import DEFAULT_ESP_CAM_BASE_URL, ProjectConfig
 from sagri.supervisor.process_supervisor import ProcessSupervisor
 
 # Programs launched as subprocesses, mapped to whether they should be
@@ -6,13 +6,19 @@ from sagri.supervisor.process_supervisor import ProcessSupervisor
 # cloud_adapter.py are added conditionally (see build_programs()).
 BASE_PROGRAMS = {
     "run_sensor_receiver.py": True,
-    "esp_cam_receiver.py": True,
+    "esp_cam_scheduler.py": True,
     "local_api.py": True,
 }
 
 
 def build_programs(config: ProjectConfig) -> dict:
     programs = dict(BASE_PROGRAMS)
+
+    if config.esp_cam_base_url == DEFAULT_ESP_CAM_BASE_URL:
+        print(
+            "[WARNING] SAGRI_ESP_CAM_URL is not configured — "
+            "esp_cam_scheduler.py will keep retrying until it's set."
+        )
 
     if config.inference_enabled:
         programs["inference_worker.py"] = True
