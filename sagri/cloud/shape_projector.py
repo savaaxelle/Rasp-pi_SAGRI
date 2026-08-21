@@ -9,9 +9,13 @@ class CloudShapeProjector:
     actually POSTs, so the two can't drift apart.
     """
 
+    # Aliases include both snake_case (documented/generic) and the
+    # exact camelCase names sent by the real ESP32 sensor firmware
+    # (All_in_one_belumtestrum.ino's fillJson()).
     SENSOR_FIELD_ALIASES = {
         "soil_moisture": (
             "soil_moisture",
+            "soilMoisture",
             "soil",
             "soil_moisture_percent",
         ),
@@ -21,21 +25,25 @@ class CloudShapeProjector:
         ),
         "air_temp": (
             "air_temp",
+            "airTemperature",
             "temperature",
             "temp",
             "air_temperature",
         ),
         "air_humidity": (
             "air_humidity",
+            "airHumidity",
             "humidity",
             "relative_humidity",
         ),
         "co2": (
             "co2",
+            "carbonDioxide",
             "co2_ppm",
         ),
         "pressure": (
             "pressure",
+            "barometricPressure",
             "pressure_hpa",
         ),
     }
@@ -43,16 +51,20 @@ class CloudShapeProjector:
     WEATHER_FIELD_ALIASES = {
         "solar_radiation": (
             "solar_radiation",
+            "solarRadiation",
             "radiation",
         ),
         "wind_speed": (
             "wind_speed",
+            "windSpeed",
         ),
         "wind_direction": (
             "wind_direction",
+            "windDirection",
         ),
         "rainfall": (
             "rainfall",
+            "rainLevel",
             "rain",
         ),
     }
@@ -119,14 +131,21 @@ class CloudShapeProjector:
 
     @staticmethod
     def _get_timestamp(record):
-        """Prefer source timestamp, then use Raspberry Pi receive time."""
+        """
+        Prefer the Raspberry Pi's own receive time over anything the
+        device sent. The Pi's clock is reliably NTP-synced UTC; a
+        device-supplied "timestamp"/"captured_at" is not guaranteed to
+        be — e.g. an ESP32 without NTP sync can send a near-zero Unix
+        epoch under a plain "timestamp" key, which would silently
+        produce garbage dates if trusted first.
+        """
 
         for key in (
+            "raspberry_timestamp",
+            "raspi_received_time",
             "timestamp",
             "captured_at",
             "sensor_timestamp",
-            "raspberry_timestamp",
-            "raspi_received_time",
         ):
             value = record.get(key)
 

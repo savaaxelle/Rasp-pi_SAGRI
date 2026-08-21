@@ -44,6 +44,7 @@ class SerialSensorReceiver:
         print("ESP32 JSON SERIAL RECEIVER + CRC + ACK")
         print("=" * 50)
         print(f"Project directory : {self._config.project_directory}")
+        print(f"Storage root      : {self._config.storage_root}")
         print(f"Output file       : {self._config.sensor_output_file}")
         print()
 
@@ -91,28 +92,27 @@ class SerialSensorReceiver:
                 break
             except ValueError:
                 print("[ERROR] Received serial data is not valid UTF-8.")
-                self._link.send_nack(0, "UTF8_ERROR")
                 continue
 
             if raw_line is None:
+                continue
+
+            if not self._codec.is_data_packet(raw_line):
+                # The firmware also prints plain debug/status text
+                # (sensor dumps, retry logs) — echo it like a serial
+                # monitor, but there's nothing to ACK/NACK.
+                print(f"[ESP32] {raw_line}")
                 continue
 
             print()
             print(f"[RX] {raw_line}")
 
             try:
-                packet = self._codec.decode(raw_line)
+                sequence, packet = self._codec.decode(raw_line)
             except ValueError as error:
-                error_text = str(error)
-                print(f"[PACKET ERROR] {error_text}")
-                self._link.send_nack(0, error_text)
-                continue
-
-            sequence = packet.get("seq")
-
-            if sequence is None:
-                print("[ERROR] Packet does not contain a sequence number.")
-                self._link.send_nack(0, "SEQ_NOT_FOUND")
+                # No trustworthy sequence to reply to — the firmware
+                # will retry and time out on its own.
+                print(f"[PACKET ERROR] {error}")
                 continue
 
             print(f"[CRC OK] Packet #{sequence}")
@@ -130,7 +130,7 @@ class SerialSensorReceiver:
                 saved_path = self._repository.save(packet)
             except Exception as error:
                 print(f"[SAVE ERROR] {error}")
-                self._link.send_nack(sequence, "SAVE_ERROR")
+                self._link.send_nack(sequence)
                 continue
 
             self._dup_filter.remember(sequence)

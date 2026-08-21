@@ -1,7 +1,6 @@
-from pathlib import Path
-
 import serial
 from serial import SerialException
+from serial.tools import list_ports
 
 BAUD_RATE = 115200
 SERIAL_TIMEOUT = 2
@@ -25,15 +24,21 @@ class SerialLink:
 
     @staticmethod
     def find_port() -> str:
-        possible_ports = []
+        """
+        Find a connected serial device.
 
-        possible_ports.extend(sorted(Path("/dev").glob("ttyUSB*")))
-        possible_ports.extend(sorted(Path("/dev").glob("ttyACM*")))
+        Uses pyserial's own device scanner instead of matching
+        Linux-only /dev/ttyUSB*/ttyACM* names, so this works the same
+        way on the Pi (Linux) and on a dev machine (Windows COMx,
+        macOS /dev/cu.*) for local testing/debugging.
+        """
 
-        if not possible_ports:
+        ports = list(list_ports.comports())
+
+        if not ports:
             return None
 
-        return str(possible_ports[0])
+        return ports[0].device
 
     @property
     def is_open(self) -> bool:
@@ -66,17 +71,20 @@ class SerialLink:
         return raw_line or None
 
     def send_ack(self, sequence) -> None:
-        message = f"ACK:{sequence}\n"
+        # "ACK|<seq>" — the ESP32 firmware compares this exact string
+        # (waitForUsbAck() in All_in_one_belumtestrum.ino), so the
+        # format must match precisely: pipe-separated, no extra text.
+        message = f"ACK|{sequence}\n"
 
         self._connection.write(message.encode("utf-8"))
         self._connection.flush()
 
-        print(f"[TX] ACK:{sequence}")
+        print(f"[TX] ACK|{sequence}")
 
-    def send_nack(self, sequence, reason: str) -> None:
-        message = f"NACK:{sequence}:{reason}\n"
+    def send_nack(self, sequence) -> None:
+        message = f"NACK|{sequence}\n"
 
         self._connection.write(message.encode("utf-8"))
         self._connection.flush()
 
-        print(f"[TX] NACK:{sequence}:{reason}")
+        print(f"[TX] NACK|{sequence}")
